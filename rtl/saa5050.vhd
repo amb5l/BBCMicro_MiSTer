@@ -1,561 +1,394 @@
--- BBC Micro for Altera DE1
---
--- Copyright (c) 2011 Mike Stirling
---
--- All rights reserved
---
--- Redistribution and use in source and synthezised forms, with or without
--- modification, are permitted provided that the following conditions are met:
---
--- * Redistributions of source code must retain the above copyright notice,
---   this list of conditions and the following disclaimer.
---
--- * Redistributions in synthesized form must reproduce the above copyright
---   notice, this list of conditions and the following disclaimer in the
---   documentation and/or other materials provided with the distribution.
---
--- * Neither the name of the author nor the names of other contributors may
---   be used to endorse or promote products derived from this software without
---   specific prior written agreement from the author.
---
--- * License is granted for non-commercial use only.  A fee may not be charged
---   for redistributions as source code or in synthesized/hardware form without
---   specific prior written agreement from the author.
---
--- THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
--- AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
--- THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
--- PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE
--- LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
--- CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
--- SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
--- INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
--- CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
--- ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
--- POSSIBILITY OF SUCH DAMAGE.
---
--- SAA5050 teletext generator
---
--- Synchronous implementation for FPGA.  Certain TV-specific functions are
--- not implemented.  e.g.
---
--- No /SI pin - 'TEXT' mode is permanently enabled
--- No remote control features (/DATA, DLIM)
--- No large character support
--- No support for box overlay (BLAN, PO, DE)
---
---
---
--- (C) 2011 Mike Stirling
---
--- Updated to run at 12MHz rather than 6MHz
--- Character rounding added
--- Implemented Graphics Hold
--- Lots of fixes to correctly implement Set-At and Set-After control codes
---
--- (C) 2015 David Banks
+--------------------------------------------------------------------------------
+-- saa5050.vhd                                                                --
+-- SAA5050 compatible teletext character generator.                           --
+--------------------------------------------------------------------------------
+-- (C) Copyright 2022 Adam Barnes <ambarnes@gmail.com>                        --
+-- This file is part of The Tyto Project. The Tyto Project is free software:  --
+-- you can redistribute it and/or modify it under the terms of the GNU Lesser --
+-- General Public License as published by the Free Software Foundation,       --
+-- either version 3 of the License, or (at your option) any later version.    --
+-- The Tyto Project is distributed in the hope that it will be useful, but    --
+-- WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY --
+-- or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public     --
+-- License for more details. You should have received a copy of the GNU       --
+-- Lesser General Public License along with The Tyto Project. If not, see     --
+-- https://www.gnu.org/licenses/.                                             --
+--------------------------------------------------------------------------------
 
 library ieee;
 use ieee.std_logic_1164.all;
-use ieee.std_logic_unsigned.all;
+
+package saa5050_pkg is
+
+    component saa5050  is
+        port (
+            rsta      : in    std_logic;                    -- asynchronous (global) reset
+            debug     : in    std_logic;                    -- debug enable (display attributes)
+            chr_clk   : in    std_logic;                    -- character clock        } normally
+            chr_clken : in    std_logic;                    -- character clock enable }  1MHz
+            chr_rst   : in    std_logic;                    -- character clock synchronous reset
+            chr_f     : in    std_logic;                    -- field (0 = 1st/odd/upper, 1 = 2nd/even/lower)
+            chr_vs    : in    std_logic;                    -- CRTC vertical sync
+            chr_hs    : in    std_logic;                    -- CRTC horizontal sync
+            chr_hb    : in    std_logic;                    -- CRTC horizontal blank (optional)
+            chr_de    : in    std_logic;                    -- CRTC display enable
+            chr_d     : in    std_logic_vector(6 downto 0); -- CRTC character code (0..127)
+            pix_clk   : in    std_logic;                    -- pixel clock        } normally
+            pix_clken : in    std_logic;                    -- pixel clock enable }  12MHz
+            pix_rst   : in    std_logic;                    -- pixel clock synchronous reset
+            pix_d     : out   std_logic_vector(2 downto 0); -- pixel data (3 bit BGR)
+            pix_hb    : out   std_logic;                    -- pixel horizontal blank (optional)
+            pix_de    : out   std_logic                     -- pixel enable
+        );
+    end component saa5050;
+
+end package saa5050_pkg;
+
+--------------------------------------------------------------------------------
+
+library ieee;
+use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
+library work;
+use work.saa5050_rom_data_pkg.all;
+
 entity saa5050 is
-port (
-    CLOCK       :   in  std_logic;
-    -- 6 MHz dot clock enable
-    CLKEN       :   in  std_logic;
-    -- Async reset
-    nRESET      :   in  std_logic;
-
-    -- Character data input (in the bus clock domain)
-    DI_CLOCK    :   in  std_logic;
-    DI_CLKEN    :   in  std_logic;
-    DI          :   in  std_logic_vector(6 downto 0);
-
-    -- Data entry window - high during VSYNC.
-    -- Resets ROM row counter and drives 'flash' signal
-    DEW         :   in  std_logic; -- VSYNC
-    -- Character rounding select - high during even field
-    CRS         :   in  std_logic; -- FIELD
-    -- Load output shift register enable - high during active video
-    LOSE        :   in  std_logic; -- DE
-
-    HBLANK_IN  :   in  std_logic;
-    HBLANK_OUT :   out std_logic;
-
-    -- Video out
-    R           :   out std_logic;
-    G           :   out std_logic;
-    B           :   out std_logic;
-    Y           :   out std_logic
+    port (
+        rsta      : in    std_logic;                    -- asynchronous (global) reset
+        debug     : in    std_logic;                    -- debug enable (display attributes)
+        chr_clk   : in    std_logic;                    -- character clock        } normally
+        chr_clken : in    std_logic;                    -- character clock enable }  1MHz
+        chr_rst   : in    std_logic;                    -- character clock synchronous reset
+        chr_f     : in    std_logic;                    -- field (0 = 1st/odd/upper, 1 = 2nd/even/lower)
+        chr_vs    : in    std_logic;                    -- CRTC vertical sync
+        chr_hs    : in    std_logic;                    -- CRTC horizontal sync
+        chr_hb    : in    std_logic;                    -- CRTC horizontal blank (optional)
+        chr_de    : in    std_logic;                    -- CRTC display enable
+        chr_d     : in    std_logic_vector(6 downto 0); -- CRTC character code (0..127)
+        pix_clk   : in    std_logic;                    -- pixel clock        } normally
+        pix_clken : in    std_logic;                    -- pixel clock enable }  12MHz
+        pix_rst   : in    std_logic;                    -- pixel clock synchronous reset
+        pix_d     : out   std_logic_vector(2 downto 0); -- pixel data (3 bit BGR)
+        pix_hb    : out   std_logic;                    -- pixel horizontal blank (optional)
+        pix_de    : out   std_logic                     -- pixel enable
     );
-end entity;
+end entity saa5050;
 
-architecture rtl of saa5050 is
+architecture synth of saa5050 is
 
--- Register inputs in the bus clock domain
-signal di_r         :   std_logic_vector(6 downto 0);
-signal dew_r        :   std_logic;
-signal lose_r       :   std_logic;
-signal hblank_r     :   std_logic;
--- Data input registered in the pixel clock domain
-signal code         :   std_logic_vector(6 downto 0);
-signal line_addr    :   unsigned(3 downto 0);
-signal rom_address1 :   std_logic_vector(11 downto 0);
-signal rom_data1    :   std_logic_vector(7 downto 0);
+    signal rst_sc       : std_logic_vector(0 to 1);     -- rsta synchroniser to character clock
+    signal rst_sp       : std_logic_vector(0 to 1);     -- rsta synchroniser to pixel clock
 
--- Delayed display enable derived from LOSE by delaying for one and two characters
-signal disp_enable  :   std_logic;
--- Latched timing signals for detection of falling edges
-signal dew_latch    :   std_logic;
-signal lose_latch   :   std_logic;
-signal hbl_latch    :   std_logic;
-signal hbl,hbl2     :   std_logic;
-signal hbld         :   std_logic_vector(2 downto 0);
-signal disp_enable_latch    :   std_logic;
+    signal chr_vs1      : std_logic;                    -- chr_vs, registered
+    signal chr_hb1      : std_logic;                    -- chr_hb, registered
+    signal chr_de1      : std_logic;                    -- chr_de, registered
+    signal chr_di       : integer range 0 to 127;       -- integer version of input data
+    signal chr_d1       : std_logic_vector(6 downto 0); -- character code, registered
+    signal chr_di1      : integer range 0 to 127;       -- integer version of above
 
--- Row and column addressing is handled externally.  We just need to
--- keep track of which of the 10 lines we are on within the character...
-signal line_counter :   unsigned(3 downto 0);
--- ... and which of the 12 pixels we are on within each line
-signal pixel_counter :  unsigned(3 downto 0);
--- We also need to count frames to implement the flash feature.
--- The datasheet says this is 0.75 Hz with a 3:1 on/off ratio, so it
--- is probably a /64 counter, which gives us 0.78 Hz
-signal flash_counter :  unsigned(5 downto 0);
--- Output shift register
-signal shift_reg    :   std_logic_vector(5 downto 0);
+    -- attribute states                                                                         SET             CLEAR
+    signal attr_gfx     : std_logic;                    -- graphics (not text)                  after 11..17    after 01..07
+    signal attr_fgcol   : std_logic_vector(2 downto 0); -- current foreground colour, BGR       after 11..17      n/a
+    signal attr_flash   : std_logic;                    -- flash (not steady)                   after 08           at 09
+    signal attr_dbl     : std_logic;                    -- double height text                   after 0D           at 0C
+    signal attr_hide    : std_logic;                    -- conceal characters                      at 18
+    signal attr_sep     : std_logic;                    -- separate (not contiguous) graphics      at 1A           at 19
+    signal attr_bgcol   : std_logic_vector(2 downto 0); -- current background colour, BGR          at 1C,1D
+    signal attr_hold    : std_logic;                    -- graphics hold                           at 1E           at 1F
 
--- Flash mask
-signal flash        :   std_logic;
+    -- derived attributes
+    signal attr_dbltop  : std_logic;                    -- latches occurence of top half of double height characters
+    signal attr_dblbot  : std_logic;                    -- bottom half of double height characters
 
--- Current display state
--- Foreground colour (B2, G1, R0)
-signal fg           :   std_logic_vector(2 downto 0);
--- Background colour (B2, G1, R0)
-signal bg           :   std_logic_vector(2 downto 0);
-signal conceal      :   std_logic;
-signal gfx          :   std_logic;
-signal gfx_sep      :   std_logic;
-signal gfx_hold     :   std_logic;
-signal is_flash     :   std_logic;
-signal double_high  :   std_logic;
+    -- flags for set-after attributes
+    signal set_gfx      : std_logic;                    -- set attr_gfx at next character
+    signal clr_gfx      : std_logic;                    -- clr attr_gfx at next character
+    signal set_fgcol    : std_logic;                    -- set attr_fgcol at next character
+    signal set_flash    : std_logic;                    -- set attr_flash at next character
+    signal set_dbl      : std_logic;                    -- set attr_dbl at next character
 
--- One-shot versions of certain control signals to support "Set-After" semantics
-signal fg_next          : std_logic_vector(2 downto 0);
-signal alpha_next       : std_logic;
-signal gfx_next         : std_logic;
-signal gfx_release_next : std_logic;
-signal is_flash_next    : std_logic;
-signal double_high_next : std_logic;
-signal unconceal_next   : std_logic;
+    signal count_flash  : unsigned(5 downto 0);         -- counter for flashing characters
+    signal flash_state  : std_logic;                    -- current flash state
 
--- Once char delayed versions of all of the signals seen by the ROM/Shift Register/Output Stage
--- This is to compensate for the one char delay through the control state machine
-signal code_r       :   std_logic_vector(6 downto 0);
-signal disp_enable_r:   std_logic;
-signal fg_r         :   std_logic_vector(2 downto 0);
-signal bg_r         :   std_logic_vector(2 downto 0);
-signal conceal_r    :   std_logic;
-signal is_flash_r   :   std_logic;
+    signal row_sd       : unsigned(3 downto 0);         -- row within std def character (0..9)
+    signal row_hd       : unsigned(4 downto 0);         -- row within high def (smoothed) character (0..19)
+    signal col_hd       : unsigned(3 downto 0);         -- col within high def (smoothed) character (0..11)
 
--- Last graphics character, for use by graphics hold
-signal last_gfx_sep     : std_logic;
-signal last_gfx         : std_logic_vector(6 downto 0);
-signal hold_active      : std_logic;
-
--- Set in first row of double height
-signal double_high1 :   std_logic;
--- Set in second row of double height
-signal double_high2 :   std_logic;
+    signal rom_row_cur  : unsigned(3 downto 0);         -- current row within ROM character pattern (0..9)
+    signal rom_row_adj  : unsigned(3 downto 0);         -- adjacent row within ROM character pattern (0..9) (above or below current row for rounding)
+    signal rom_data_cur : std_logic_vector(4 downto 0); -- pixels for current row from ROM
+    signal rom_data_adj : std_logic_vector(4 downto 0); -- pixels for adjacent row from ROM
+    signal held_c       : std_logic_vector(6 downto 0); -- held graphics character code
+    signal held_s       : std_logic;                    -- held graphics separate state
+    signal chr_g        : std_logic_vector(6 downto 0); -- graphics character code (latest or held)
+    signal chr_s        : std_logic;                    -- graphics separate (latest or held)
+    signal gfx_data     : std_logic_vector(5 downto 0); -- pixels for graphics pattern
+    signal pix_sr_cur   : std_logic_vector(6 downto 0); -- pixel output shift register (current row)
+    signal pix_sr_adj   : std_logic_vector(6 downto 0); -- pixel output shift register (adjacent row for character rounding)
 
 begin
 
-    HBLANK_OUT <= hbld(1);
+    chr_di <= to_integer(unsigned(chr_d));
+    chr_di1 <= to_integer(unsigned(chr_d1));
 
-    -- Generate flash signal for 3:1 ratio
-    flash <= flash_counter(5) and flash_counter(4);
-
-    -- Sync inputs
-    process(DI_CLOCK,nRESET)
+    -- character clock domain
+    process(chr_clk)
     begin
-        if nRESET = '0' then
-            di_r <= (others => '0');
-            dew_r <= '0';
-            lose_r <= '0';
-            hblank_r <= '1';
-        elsif rising_edge(DI_CLOCK) then
-            if DI_CLKEN = '1' then
-                di_r <= DI;
-                dew_r <= DEW;
-                lose_r <= LOSE;
-                hblank_r <= HBLANK_IN;
-            end if;
+        if rising_edge(chr_clk) then
+            rst_sc(0 to 1) <= rsta & rst_sc(0);
         end if;
-    end process;
-
-    -- Register data into pixel clock domain
-    process(CLOCK,nRESET)
-    begin
-        if nRESET = '0' then
-            code          <= (others => '0');
-            code_r        <= (others => '0');
-            disp_enable_r <= '0';
-            fg_r          <= (others => '0');
-            bg_r          <= (others => '0');
-            conceal_r     <= '0';
-            is_flash_r    <= '0';
-        elsif rising_edge(CLOCK) then
-            if CLKEN = '1' then
-                code <= di_r;
-                hbld <= hbld(1 downto 0) & hbld(0);
-                if pixel_counter = 0 then
-                    code_r        <= code;
-                    disp_enable_r <= disp_enable;
-                    hbld          <= hbld(1 downto 0) & hbl;
-                    fg_r          <= fg;
-                    bg_r          <= bg;
-                    conceal_r     <= conceal;
-                    is_flash_r    <= is_flash;
+        if rising_edge(chr_clk) and chr_clken = '1' then
+            if chr_rst = '1' or rst_sc(1) = '1' then
+                chr_vs1     <= '0';
+                chr_hb1     <= '1';
+                chr_de1     <= '0';
+                chr_d1      <= (others => '0');
+                row_sd      <= (others => '0');
+                attr_fgcol  <= (others => '1');
+                attr_bgcol  <= (others => '0');
+                attr_flash  <= '0';
+                attr_dbl    <= '0';
+                attr_dbltop <= '0';
+                attr_dblbot <= '0';
+                attr_gfx    <= '0';
+                attr_sep    <= '0';
+                attr_hold   <= '0';
+                attr_hide   <= '0';
+                held_c      <= (others => '0');
+                held_s      <= '0';
+                count_flash <= (others => '0');
+                flash_state <= '1';
+            else
+                chr_vs1 <= chr_vs;
+                chr_hb1 <= chr_hb;
+                chr_de1 <= chr_de;
+                chr_d1 <= chr_d;
+                if chr_vs = '1' then
+                    row_sd      <= (others => '0');
+                    attr_dbltop <= '0';
+                    attr_dblbot <= '0';
+                    if chr_vs1 = '0' then
+                        count_flash <= count_flash+1;
+                        flash_state <= count_flash(5) or count_flash(4);
+                    end if;
                 end if;
-            end if;
-        end if;
-    end process;
-
-    -- Character row and pixel counters
-    process(CLOCK,nRESET)
-    begin
-        if nRESET = '0' then
-            dew_latch <= '0';
-            lose_latch <= '0';
-            disp_enable <= '0';
-            disp_enable_latch <= '0';
-            double_high1 <= '0';
-            double_high2 <= '0';
-            line_counter <= (others => '0');
-            pixel_counter <= (others => '0');
-            flash_counter <= (others => '0');
-        elsif rising_edge(CLOCK) then
-            if CLKEN = '1' then
-                -- Register syncs for edge detection
-                dew_latch <= dew_r;
-                lose_latch <= lose_r;
-                hbl_latch <= hblank_r;
-                disp_enable_latch <= disp_enable;
-
-                -- When first entering double-height mode start on top row
-                if double_high = '1' and double_high1 = '0' and double_high2 = '0' then
-                    double_high1 <= '1';
+                if chr_hs = '1' then
+                    -- defaults at beginning of row
+                    attr_fgcol <= (others => '1');
+                    attr_bgcol <= (others => '0');
+                    attr_flash <= '0';
+                    attr_dbl   <= '0';
+                    attr_gfx   <= '0';
+                    attr_sep   <= '0';
+                    attr_hold  <= '0';
+                    attr_hide  <= '0';
+                    held_c     <= (others => '0');
+                    held_s     <= '0';
                 end if;
-
-                -- Count pixels between 0 and 11
-                if pixel_counter = 5 then
-                    -- Start of next character and delayed display enable
-                    pixel_counter <= (others => '0');
-                    disp_enable <= lose_latch;
-                    hbl2 <= hbl_latch;
-                    hbl <= hbl2;
-                else
-                    pixel_counter <= pixel_counter + 1;
-                end if;
-
-                -- Rising edge of LOSE is the start of the active line
-                if lose_r = '1' and lose_latch = '0' then
-                    -- Reset pixel counter - small offset to make the output
-                    -- line up with the cursor from the video ULA
-                    pixel_counter <= "0100";
-                end if;
-
-                -- Count frames on end of VSYNC (falling edge of DEW)
-                if dew_r = '0' and dew_latch = '1' then
-                    flash_counter <= flash_counter + 1;
-                end if;
-
-                if dew_r = '1' then
-                    -- Reset line counter and double height state during VSYNC
-                    line_counter <= (others => '0');
-                    double_high1 <= '0';
-                    double_high2 <= '0';
-                else
-                    -- Count lines on end of active video (falling edge of disp_enable)
-                    if disp_enable = '0' and disp_enable_latch = '1' then
-                        if line_counter = 9 then
-                            line_counter <= (others => '0');
-
-                            -- Keep track of which row we are on for double-height
-                            -- The double_high flag can be cleared before the end of a row, but if
-                            -- double height characters are used anywhere on a row then the double_high1
-                            -- flag will be set and remain set until the next row.  This is used
-                            -- to determine that the bottom half of the characters should be shown if
-                            -- double_high is set once again on the row below.
-                            double_high1 <= '0';
-                            double_high2 <= double_high1;
-                        else
-                            line_counter <= line_counter + 1;
+                if chr_de = '1' then
+                    -- handle set-after codes
+                    set_gfx   <= '0';
+                    clr_gfx   <= '0';
+                    set_fgcol <= '0';
+                    set_flash <= '0';
+                    set_dbl   <= '0';
+                    if clr_gfx = '1' then
+                        attr_gfx <= '0';
+                        if attr_gfx = '1' then -- change to alpha from mosaic
+                            attr_hold <= '0';
+                            held_c <= (others => '0');
+                            held_s <= '0';
                         end if;
                     end if;
-                end if;
-            end if;
-        end if;
+                    if set_gfx = '1' then
+                        attr_gfx <= '1';
+                    end if;
+                    if set_fgcol = '1' then
+                        attr_fgcol <= chr_d1(2 downto 0);
+                        attr_hide <= '0';
+                    end if;
+                    if set_flash = '1' then
+                        attr_flash <= '1';
+                    end if;
+                    if set_dbl = '1' then
+                        attr_dbl <= '1';
+                        attr_dbltop <= not attr_dblbot;
+                        if attr_dbl = '0' then -- change of size
+                            attr_hold <= '0';
+                            held_c <= (others => '0');
+                            held_s <= '0';
+                        end if;
+                    end if;
+                    -- handle codes
+                    case to_integer(unsigned(chr_d)) is
+                        when 16#01# to 16#07# => -- text (alpha) colour (set-after)
+                            clr_gfx <= '1';
+                            set_fgcol <= '1';
+                        when 16#08# => -- flash (set-after)
+                            set_flash <= '1';
+                        when 16#09# => -- steady (set-at)
+                            attr_flash <= '0';
+                        when 16#0C# => -- normal size (set-at)
+                            attr_dbl <= '0';
+                            if attr_dbl = '1' then -- change of size
+                                attr_hold <= '0';
+                                held_c <= (others => '0');
+                                held_s <= '0';
+                            end if;
+                        when 16#0D# => -- double height (set-after)
+                            set_dbl <= '1';
+                        when 16#10# to 16#17# => -- graphics colour (set-after)
+                            set_gfx <= '1';
+                            set_fgcol <= '1';
+                        when 16#18# => -- conceal (set-at)
+                            attr_hide <= '1';
+                        when 16#19# => -- contiguous graphics (set-at)
+                            attr_sep <= '0';
+                        when 16#1A# => -- separated graphics (set-at)
+                            attr_sep <= '1';
+                        when 16#1C# => -- black background colour (set-at)
+                            attr_bgcol <= (others => '0');
+                        when 16#1D# => -- new background colour (set-at)
+                            if set_fgcol = '1' then
+                                attr_bgcol <= chr_d1(2 downto 0);
+                            else
+                                attr_bgcol <= attr_fgcol;
+                            end if;
+                        when 16#1E# => -- graphics hold (set-at)
+                            attr_hold <= '1';
+                        when 16#1F# => -- graphics release (set_after)
+                            clr_gfx <= '1';
+                        when others => null;
+                    end case;
+                    -- held graphics character
+                    if (set_gfx = '1' or attr_gfx = '1')
+                    and ((chr_di >= 32 and chr_di <= 63) or (chr_di >= 96 and chr_di <= 127)) then
+                        held_c <= chr_d;
+                        held_s <= attr_sep;
+                    end if;
+                elsif chr_de1 = '1' then -- trailing edge of de
+                    if row_sd = 9 then
+                        row_sd <= (others => '0');
+                        attr_dblbot <= attr_dbltop;
+                        attr_dbltop <= '0';
+                    else
+                        row_sd <= row_sd+1;
+                    end if;
+                end if; -- de = '1'
+            end if; -- rst = '1'
+        end if; -- rising_edge(chr_clk) and chr_clken = '1'
     end process;
 
+    row_hd <=
+        row_sd & chr_f when debug = '1' and chr_d(6 downto 5) = "00" else
+        ('0' & row_sd)+10 when attr_dbl = '1' and attr_dblbot = '1' else
+        '0' & row_sd      when attr_dbl = '1' else
+        row_sd & chr_f;
 
+    rom_row_cur <= row_hd(4 downto 1);
+    rom_row_adj <= row_hd(4 downto 1)-1 when row_hd(0) = '0' else row_hd(4 downto 1)+1;
 
-    -- Control character handling
-    process(CLOCK,nRESET)
+    -- text character pixel data (dual port synchronous ROM)
+    ROM: process(chr_clk)
     begin
-        if nRESET = '0' then
-            -- Current Attributes
-            fg               <= (others => '1');
-            bg               <= (others => '0');
-            conceal          <= '0';
-            gfx              <= '0';
-            gfx_sep          <= '0';
-            gfx_hold         <= '0';
-            is_flash         <= '0';
-            double_high      <= '0';
-            -- One-shot versions to support "Set-After" semantics
-            fg_next          <= (others => '0');
-            gfx_next         <= '0';
-            alpha_next       <= '0';
-            gfx_release_next <= '0';
-            is_flash_next    <= '0';
-            double_high_next <= '0';
-            unconceal_next   <= '0';
-            -- Last graphics character
-            last_gfx         <= (others => '0');
-            last_gfx_sep     <= '0';
-        elsif rising_edge(CLOCK) then
-            if CLKEN = '1' then
-                -- Reset to start of line defaults
-                if disp_enable = '0' then
-                    -- Current Attributes
-                    fg               <= (others => '1');
-                    bg               <= (others => '0');
-                    conceal          <= '0';
-                    gfx              <= '0';
-                    gfx_sep          <= '0';
-                    gfx_hold         <= '0';
-                    is_flash         <= '0';
-                    double_high      <= '0';
-                    -- One-shot versions to support "Set-After" semantics
-                    fg_next          <= (others => '0');
-                    gfx_next         <= '0';
-                    alpha_next       <= '0';
-                    gfx_release_next <= '0';
-                    is_flash_next    <= '0';
-                    double_high_next <= '0';
-                    unconceal_next   <= '0';
-                    -- Last graphics character
-                    last_gfx         <= (others => '0');
-                    last_gfx_sep     <= '0';
-                elsif pixel_counter = 0 then
-                    -- One-shot versions to support "Set-After" semantics
-                    fg_next          <= (others => '0');
-                    gfx_next         <= '0';
-                    alpha_next       <= '0';
-                    gfx_release_next <= '0';
-                    is_flash_next    <= '0';
-                    double_high_next <= '0';
-                    unconceal_next   <= '0';
-                    -- Latch the last graphic character (inc seperation), to support graphics hold
-                    if code(5) = '1' then
-                        last_gfx <= code;
-                        last_gfx_sep <= gfx_sep;
+        if rising_edge(chr_clk) and chr_clken = '1' then
+            rom_data_cur <= rom_data(to_integer(unsigned(chr_d) & rom_row_cur));
+            rom_data_adj <= rom_data(to_integer(unsigned(chr_d) & rom_row_adj));
+        end if;
+    end process ROM;
+
+    -- graphics character code / separation depends on hold
+    chr_g <= held_c when attr_hold = '1' and chr_di1 <= 31 else chr_d1;
+    chr_s <= held_s when attr_hold = '1' and chr_di1 <= 31 else attr_sep;
+
+    -- graphics character pixel data
+    gfx_data <=
+        (others => '0') when chr_s = '1' and (row_sd = 2 or row_sd = 6 or row_sd = 9) else
+        (chr_g(0) and not chr_s) & chr_g(0) & chr_g(0) & (chr_g(1) and not chr_s) & chr_g(1) & chr_g(1) when row_sd >= 0 and row_sd <= 2 else
+        (chr_g(2) and not chr_s) & chr_g(2) & chr_g(2) & (chr_g(3) and not chr_s) & chr_g(3) & chr_g(3) when row_sd >= 3 and row_sd <= 6 else
+        (chr_g(4) and not chr_s) & chr_g(4) & chr_g(4) & (chr_g(6) and not chr_s) & chr_g(6) & chr_g(6);
+
+    -- pixel clock domain
+    process(pix_clk)
+        variable nn_chr_diag, nn_v, nn_h : std_logic; -- nearest neighbour pixels
+    begin
+        if rising_edge(pix_clk) then
+            rst_sp(0 to 1) <= rsta & rst_sp(0);
+        end if;
+        if rising_edge(pix_clk) and pix_clken = '1' then
+            pix_d <= (others => '0');
+            pix_de <= '0';
+            if pix_rst = '1' or rst_sp(1) = '1' then
+                col_hd     <= (others => '0');
+                pix_sr_cur <= (others => '0');
+                pix_sr_adj <= (others => '0');
+            else
+                pix_hb <= chr_hb1;
+                if chr_de1 = '1' then
+                    pix_de <= '1';
+                    pix_d <= attr_bgcol;
+                    if debug = '1' and chr_d1(6 downto 5) = "00" then
+                        pix_d <= (others => '0');
                     end if;
-                    -- Latch new control codes at the start of each character
-                    if code(6 downto 5) = "00" then
-                        if code(3) = '0' then
-                            -- 0 would be black but is not allowed so has no effect
-                            if code(2 downto 0) /= "000" then
-                                -- Colour and graphics setting clears conceal mode - Set After
-                                unconceal_next <= '1';
-                                -- Select the foreground colout - Set After
-                                fg_next <= code(2 downto 0);
-                                -- Select graphics or alpha mode - Set After
-                                if code(4) = '1' then
-                                    gfx_next <= '1';
-                                else
-                                    alpha_next <= '1';
-                                    gfx_release_next <= '1';
-                                end if;
+                    if col_hd = 0 then -- first pixel of 12
+                        pix_sr_cur <= (others => '0');
+                        pix_sr_adj <= (others => '0');
+                        if (chr_di1 >= 32 or debug = '0') and (
+                            (attr_hide = '1') or                        -- conceal
+                            (attr_flash = '1' and flash_state = '0') or -- flashing (off state)
+                            (attr_dblbot = '1' and attr_dbl = '0')      -- bottom of double height row, without double height attribute
+                        ) then
+                            null;
+                        elsif (attr_gfx = '1' and ((chr_di1 >= 32 and chr_di1 <= 63) or (chr_di1 >= 96 and chr_di1 <= 127)))
+                            or (attr_hold = '1' and not (debug = '1' and chr_di1 <= 31))
+                        then
+                            pix_sr_cur <= '0' & gfx_data;
+                            pix_sr_adj <= '0' & gfx_data;
+                            if gfx_data(5) = '1' then
+                                pix_d <= attr_fgcol;
                             end if;
                         else
-                            case code(4 downto 0) is
-                            -- FLASH - Set After
-                            when "01000" =>
-                                is_flash_next <= '1';
-                            -- STEADY - Set At
-                            when "01001" =>
-                                is_flash <= '0';
-                            -- NORMAL HEIGHT - Set At
-                            when "01100" =>
-                                double_high <= '0';
-                                -- Graphics hold character is cleared by a *change* of height
-                                if (double_high = '0') then
-                                    last_gfx <= (others => '0');
-                                end if;
-                            -- DOUBLE HEIGHT - Set After
-                            when "01101" =>
-                                double_high_next <= '1';
-                                -- Graphics hold character is cleared by a *change* of height
-                                if (double_high = '0') then
-                                    last_gfx <= (others => '0');
-                                end if;
-                            -- CONCEAL - Set At
-                            when "11000" =>
-                                conceal <= '1';
-                            -- CONTIGUOUS GFX - Set At
-                            when "11001" =>
-                                gfx_sep <= '0';
-                            -- SEPARATED GFX - Set At
-                            when "11010" =>
-                                gfx_sep <= '1';
-                            -- BLACK BACKGROUND - Set At
-                            when "11100" =>
-                                bg <= (others => '0');
-                            -- NEW BACKGROUND - Set At
-                            when "11101" =>
-                                -- if there is a pending foreground change, then use it
-                                if fg_next /= "000" then
-                                    bg <= fg_next;
-                                else
-                                    bg <= fg;
-                                end if;
-                            -- HOLD GFX - Set At
-                            when "11110" =>
-                                gfx_hold <= '1';
-                            -- RELEASE GFX - Set After
-                            when "11111" =>
-                                gfx_release_next <= '1';
-                            when others => null;
-                            end case;
-                        end if;
-                    end if;
-                    -- Delay the "Set After" control code effect until the next character
-                    if fg_next /= "000" then
-                        fg <= fg_next;
-                    end if;
-                    if gfx_next = '1' then
-                        gfx <= '1';
-                    end if;
-                    if alpha_next = '1' then
-                        gfx <= '0';
-                    end if;
-                    if is_flash_next = '1' then
-                        is_flash <= '1';
-                    end if;
-                    if double_high_next = '1' then
-                        double_high <= '1';
-                    end if;
-                    if gfx_release_next = '1' then
-                        gfx_hold <= '0';
-                    end if;
-                    -- Note, conflicts can arise as setting/clearing happen in different cycles
-                    -- e.g. 03 (Alpha Yellow) 18 (Conceal) should leave us in a conceal state
-                    if conceal = '1' and unconceal_next = '1' then
-                        conceal <= '0';
-                    end if;                    
-                end if;
-            end if;
-        end if;
-    end process;
-
-    --------------------------------------------------------------------
-    -- Character ROM
-    --------------------------------------------------------------------
-
-    -- Generate character rom address in pixel clock domain
-    -- This is done combinatorially since all the inputs are already
-    -- registered and the address is re-registered by the ROM
-    line_addr <= line_counter                when double_high = '0' else
-            ("0" & line_counter(3 downto 1)) when double_high2 = '0' else
-            ("0" & line_counter(3 downto 1)) + 5;
-
-    hold_active <= '1' when gfx_hold = '1' and code_r(6 downto 5) = "00" else '0';
-
-    rom_address1 <= (others => '0') when (double_high = '0' and double_high2 = '1') else
-                    gfx & last_gfx & std_logic_vector(line_addr) when hold_active = '1' else
-                    gfx & code_r & std_logic_vector(line_addr);
-
-    char_rom : entity work.saa5050_char_rom port map (
-        clock    => CLOCK,
-        addressA => rom_address1,
-        QA       => rom_data1
-    );
-
-    --------------------------------------------------------------------
-    -- Shift register
-    --------------------------------------------------------------------
-    process(CLOCK,nRESET)
-    variable a : std_logic_vector(5 downto 0);
-    begin
-        if nRESET = '0' then
-            shift_reg <= (others => '0');
-        elsif rising_edge(CLOCK) then
-            if CLKEN = '1' then
-                if disp_enable_r = '1' and pixel_counter = 0 then
-                    -- Character rounding
-
-                    a := rom_data1(5 downto 0);
-
-                    -- If bit 7 of the ROM data is set then this is a graphics
-                    -- character and separated/hold graphics modes apply.
-                    -- We don't just assume this to be the case if gfx=1 because
-                    -- these modes don't apply to caps even in graphics mode
-                    if rom_data1(7) = '1' then
-                        -- Apply a mask for separated graphics mode
-                        if (hold_active = '0' and gfx_sep = '1') or (hold_active = '1' and last_gfx_sep = '1') then
-                            a(2) := '0';
-                            a(5) := '0';
-                            if line_counter = 2 or line_counter = 6 or line_counter = 9 then
-                                a := (others => '0');
+                            if debug = '1' or chr_di1 >= 32 then
+                                pix_sr_cur <= "00" & rom_data_cur;
+                                pix_sr_adj <= "00" & rom_data_adj;
+                            else
+                                pix_sr_cur <= (others => '0');
+                                pix_sr_adj <= (others => '0');
                             end if;
                         end if;
+                        col_hd <= (col_hd+1) mod 12;
+                    else
+                        if pix_sr_cur(5) = '1' then -- filled pixel
+                            pix_d <= attr_fgcol;
+                            if debug = '1' and chr_d1(6 downto 5) = "00" then
+                                pix_d <= (others => '1');
+                            end if;
+                        else -- empty pixel -> look at character rounding...
+                            nn_v := pix_sr_adj(5);
+                            if col_hd(0) = '0' then -- left half pixel
+                                nn_chr_diag := pix_sr_adj(6);
+                                nn_h := pix_sr_cur(6);
+                            else -- right half pixels
+                                nn_chr_diag := pix_sr_adj(4);
+                                nn_h := pix_sr_cur(4);
+                            end if;
+                            if nn_chr_diag = '0' and nn_v = '1' and nn_h = '1' then -- rounding required
+                                pix_d <= attr_fgcol;
+                            end if;
+                            if debug = '1' and chr_d1(6 downto 5) = "00" then
+                                pix_d <= (others => '0');
+                            end if;
+                        end if;
+                        if col_hd(0) = '1' then
+                            pix_sr_cur <= std_logic_vector(shift_left(unsigned(pix_sr_cur),1));
+                            pix_sr_adj <= std_logic_vector(shift_left(unsigned(pix_sr_adj),1));
+                        end if;
+                        col_hd <= (col_hd+1) mod 12;
                     end if;
-
-                    -- Load the shift register with the ROM bit pattern
-                    -- at the start of each character while disp_enable is asserted.
-                    shift_reg <= a;
-
-                else
-                    -- Pump the shift register
-                    shift_reg <= shift_reg(4 downto 0) & "0";
                 end if;
             end if;
         end if;
     end process;
 
-    --------------------------------------------------------------------
-    -- Output Pixel Colouring
-    --------------------------------------------------------------------
-    process(CLOCK,nRESET)
-    variable pixel : std_logic;
-    begin
-
-        if nRESET = '0' then
-            R <= '0';
-            G <= '0';
-            B <= '0';
-        elsif rising_edge(CLOCK) then
-            if CLKEN = '1' then
-                pixel := shift_reg(5) and not ((flash and is_flash_r) or conceal_r);
-
-                -- Generate mono output
-                Y <= pixel;
-
-                -- Generate colour output
-                if pixel = '1' then
-                    R <= fg_r(0);
-                    G <= fg_r(1);
-                    B <= fg_r(2);
-                else
-                    R <= bg_r(0);
-                    G <= bg_r(1);
-                    B <= bg_r(2);
-                end if;
-            end if;
-        end if;
-    end process;
-end architecture;
+end architecture synth;

@@ -239,6 +239,7 @@ signal mhz1_clken       : std_logic; -- 1 MHz bus and associated peripherals, 65
 -- SAA5050 needs a 12 MHz clock enable relative to a 24 MHz clock
 signal ttxt_clken_counter:unsigned(1 downto 0);
 signal ttxt_clken       : std_logic;
+signal ttxt_clken12     : std_logic; -- true 12MHz clken (ttxt_clken runs at 6MHz)
 
 -- CPU signals
 signal cpu_irq_n        : std_logic;
@@ -541,18 +542,25 @@ begin
         );
 
     teletext : entity work.saa5050 port map (
-        clock_24, -- This runs at 12 MHz, which we can't derive from the 32 MHz clock
-        ttxt_clken,
-        reset_n,
-        clock_32, -- Data input is synchronised from the bus clock domain
-        vid_clken,
-        ext_Dout(6 downto 0),
-        ttxt_dew,
-        ttxt_crs,
-        ttxt_lose,
-        crtc_hblank,
-        ttxt_hblank,
-        ttxt_r, ttxt_g, ttxt_b, open
+	        rsta      => not reset_n,          -- asynchronous (global) reset
+	        debug     => '0',                  -- debug enable (display attributes)
+	        chr_clk   => clock_32,             -- character clock        } normally
+	        chr_clken => mhz1_clken,           -- character clock enable }  1MHz
+	        chr_rst   => '0',                  -- character clock synchronous reset
+	        chr_f     => crtc_ra(0),           -- field (0 = 1st/odd/upper, 1 = 2nd/even/lower)
+	        chr_vs    => crtc_vsync,           -- CRTC vertical sync
+	        chr_hs    => crtc_hsync,           -- CRTC horizontal sync
+	        chr_hb    => crtc_hblank,          -- CRTC horizontal blank (optional)
+	        chr_de    => crtc_de,              -- CRTC display enable
+	        chr_d     => ext_Dout(6 downto 0), -- CRTC character code (0..127)
+	        pix_clk   => clock_24,             -- pixel clock        } normally
+	        pix_clken => ttxt_clken12,         -- pixel clock enable }  12MHz
+	        pix_rst   => '0',                  -- pixel clock synchronous reset
+	        pix_d(0)  => ttxt_r,               -- pixel data (R)
+	        pix_d(1)  => ttxt_g,               -- pixel data (G)
+	        pix_d(2)  => ttxt_b,               -- pixel data (B)
+	        pix_hb    => ttxt_hblank,          -- pixel horizontal blank (optional)
+	        pix_de    => open                  -- pixel enable
         );
 
     -- System VIA
@@ -927,6 +935,7 @@ begin
         if rising_edge(clock_24) then
             ttxt_clken_counter <= ttxt_clken_counter + 1;
             ttxt_clken <= ttxt_clken_counter(0) and ttxt_clken_counter(1);
+            ttxt_clken12 <= ttxt_clken_counter(0);
         end if;
     end process;
 
